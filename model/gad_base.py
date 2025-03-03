@@ -254,57 +254,95 @@ class GADBase(nn.Module):
         def compute_loss(pred_img):
             with torch.no_grad():
                 try:
-                    # Log input tensor stats
-                    logger.info(f"pred_img stats - shape: {pred_img.shape}, dtype: {pred_img.dtype}, device: {pred_img.device}")
-                    logger.info(f"pred_img values - min: {pred_img.min().item():.6f}, max: {pred_img.max().item():.6f}, mean: {pred_img.mean().item():.6f}")
+                    # Log input tensor stats with more detail
+                    logger.info("=== Starting Loss Computation ===")
+                    logger.info(f"pred_img stats:")
+                    logger.info(f"- shape: {pred_img.shape}")
+                    logger.info(f"- dtype: {pred_img.dtype}")
+                    logger.info(f"- device: {pred_img.device}")
+                    logger.info(f"- min: {pred_img.min().item():.8f}")
+                    logger.info(f"- max: {pred_img.max().item():.8f}")
+                    logger.info(f"- mean: {pred_img.mean().item():.8f}")
+                    logger.info(f"- unique values (first 5): {torch.unique(pred_img)[:5].tolist()}")
                     
                     # Log source tensor stats
-                    logger.info(f"source stats - shape: {source.shape}, dtype: {source.dtype}, device: {source.device}")
-                    logger.info(f"source values - min: {source.min().item():.6f}, max: {source.max().item():.6f}, mean: {source.mean().item():.6f}")
+                    logger.info(f"\nsource stats:")
+                    logger.info(f"- shape: {source.shape}")
+                    logger.info(f"- dtype: {source.dtype}")
+                    logger.info(f"- device: {source.device}")
+                    logger.info(f"- min: {source.min().item():.8f}")
+                    logger.info(f"- max: {source.max().item():.8f}")
+                    logger.info(f"- mean: {source.mean().item():.8f}")
+                    logger.info(f"- unique values (first 5): {torch.unique(source)[:5].tolist()}")
                     
                     # Log mask stats
-                    logger.info(f"mask_inv stats - shape: {mask_inv.shape}, dtype: {mask_inv.dtype}")
-                    logger.info(f"mask_inv coverage: {mask_inv.float().mean().item():.2%} invalid pixels")
+                    logger.info(f"\nmask_inv stats:")
+                    logger.info(f"- shape: {mask_inv.shape}")
+                    logger.info(f"- dtype: {mask_inv.dtype}")
+                    logger.info(f"- device: {mask_inv.device}")
+                    logger.info(f"- invalid pixel count: {mask_inv.sum().item()}")
+                    logger.info(f"- total pixels: {mask_inv.numel()}")
+                    logger.info(f"- invalid pixel percentage: {(mask_inv.float().mean().item()*100):.2f}%")
                     
-                    # Downsample prediction
+                    # Downsample prediction and log
+                    logger.info("\nDownsampling prediction...")
                     pred_lr = downsample(pred_img)
-                    logger.info(f"pred_lr after downsample - shape: {pred_lr.shape}")
-                    logger.info(f"pred_lr values - min: {pred_lr.min().item():.6f}, max: {pred_lr.max().item():.6f}, mean: {pred_lr.mean().item():.6f}")
+                    logger.info(f"pred_lr after downsample:")
+                    logger.info(f"- shape: {pred_lr.shape}")
+                    logger.info(f"- dtype: {pred_lr.dtype}")
+                    logger.info(f"- device: {pred_lr.device}")
+                    logger.info(f"- min: {pred_lr.min().item():.8f}")
+                    logger.info(f"- max: {pred_lr.max().item():.8f}")
+                    logger.info(f"- mean: {pred_lr.mean().item():.8f}")
+                    logger.info(f"- unique values (first 5): {torch.unique(pred_lr)[:5].tolist()}")
                     
-                    # Ensure tensors are on same device and dtype
+                    # Match device and dtype
                     pred_lr = pred_lr.to(source.device, source.dtype)
-                    logger.info(f"pred_lr after device/dtype match - dtype: {pred_lr.dtype}, device: {pred_lr.device}")
+                    logger.info(f"\npred_lr after device/dtype match:")
+                    logger.info(f"- dtype: {pred_lr.dtype}")
+                    logger.info(f"- device: {pred_lr.device}")
                     
                     # Calculate absolute difference
+                    logger.info("\nCalculating absolute difference...")
                     diff = torch.abs(pred_lr - source)
-                    logger.info(f"diff values - min: {diff.min().item():.6f}, max: {diff.max().item():.6f}, mean: {diff.mean().item():.6f}")
+                    logger.info(f"diff stats:")
+                    logger.info(f"- min: {diff.min().item():.8f}")
+                    logger.info(f"- max: {diff.max().item():.8f}")
+                    logger.info(f"- mean: {diff.mean().item():.8f}")
+                    logger.info(f"- sum: {diff.sum().item():.8f}")
+                    logger.info(f"- unique values (first 5): {torch.unique(diff)[:5].tolist()}")
                     
                     # Compute mean over valid regions
                     valid_mask = ~mask_inv
                     valid_pixels = valid_mask.sum().item()
-                    logger.info(f"Number of valid pixels: {valid_pixels}")
+                    logger.info(f"\nValid pixels: {valid_pixels} out of {mask_inv.numel()}")
                     
                     if valid_pixels > 0:
                         masked_diff = diff * valid_mask.float()
                         sum_diff = masked_diff.sum().item()
                         loss = sum_diff / valid_pixels
-                        logger.info(f"Sum of masked differences: {sum_diff:.6f}")
-                        logger.info(f"Loss (mean over valid pixels): {loss:.6f}")
+                        logger.info(f"Masked difference stats:")
+                        logger.info(f"- sum: {sum_diff:.8f}")
+                        logger.info(f"- valid pixels: {valid_pixels}")
+                        logger.info(f"- final loss: {loss:.8f}")
                     else:
                         loss = diff.mean().item()
-                        logger.info(f"No valid pixels found, using full mean: {loss:.6f}")
+                        logger.info(f"No valid pixels, using full mean: {loss:.8f}")
                     
                     if loss == 0:
-                        logger.error("Loss is exactly zero - investigating values:")
-                        logger.error(f"pred_lr unique values: {torch.unique(pred_lr)[:10]}")
-                        logger.error(f"source unique values: {torch.unique(source)[:10]}")
-                        logger.error(f"diff unique values: {torch.unique(diff)[:10]}")
+                        logger.error("\nWARNING: Loss is exactly zero!")
+                        logger.error("Detailed investigation:")
+                        logger.error(f"1. pred_lr non-zero elements: {(pred_lr != 0).sum().item()}")
+                        logger.error(f"2. source non-zero elements: {(source != 0).sum().item()}")
+                        logger.error(f"3. diff non-zero elements: {(diff != 0).sum().item()}")
+                        logger.error(f"4. masked_diff non-zero elements: {(masked_diff != 0).sum().item() if valid_pixels > 0 else 'N/A'}")
                     
+                    logger.info("=== End Loss Computation ===\n")
                     return loss
                     
                 except Exception as e:
                     logger.error(f"Error in loss computation: {str(e)}")
-                    logger.error(f"Error details:", exc_info=True)
+                    logger.error("Stack trace:", exc_info=True)
                     return float('inf')
 
         # Feature extraction with memory optimization
