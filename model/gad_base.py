@@ -160,6 +160,15 @@ class GADBase(nn.Module):
         elif feature_extractor=='UNet':
             logger.info("Using UNet with FFT enhancement")
             self.feature_extractor = smp.Unet('resnet50', classes=FEATURE_DIM//2, in_channels=INPUT_DIM)
+            # Enable gradient checkpointing for memory efficiency
+            self.feature_extractor.encoder.requires_grad_(True)
+            self.feature_extractor.encoder.train()
+            for module in self.feature_extractor.encoder.modules():
+                if isinstance(module, nn.Module):
+                    module.requires_grad_(True)
+                    if hasattr(module, 'checkpoint') and callable(module.checkpoint):
+                        module.checkpoint = True
+                        
             self.fft_branch = FFTFeatureExtractor(in_channels=INPUT_DIM, out_channels=FEATURE_DIM//2)
             self.feature_fusion = nn.Conv2d(FEATURE_DIM, FEATURE_DIM, 1)
             self.logk = torch.nn.Parameter(torch.log(torch.tensor(0.03)))
@@ -167,7 +176,12 @@ class GADBase(nn.Module):
         else:
             raise NotImplementedError(f'Feature extractor {feature_extractor}')
 
+    @torch.cuda.amp.autocast()
     def forward(self, sample, train=False, deps=0.1):
+        # Memory optimization: clear cache at the start
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # Validate inputs
         for key in ['guide', 'source', 'mask_lr', 'y_bicubic']:
             if key not in sample:
@@ -196,6 +210,10 @@ class GADBase(nn.Module):
             y_pred -= deps
             logger.debug("Reverted depth shift")
 
+        # Memory optimization: clear cache before returning
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return {**{'y_pred': y_pred}, **aux}
 
     def diffuse(self, img, guide, source, mask_inv,
@@ -209,50 +227,72 @@ class GADBase(nn.Module):
         downsample = nn.AdaptiveAvgPool2d((sh, sw))
         upsample = lambda x: F.interpolate(x, (h, w), mode='nearest')
 
-        # Feature extraction
+        # Feature extraction with memory optimization
         if self.feature_extractor is None: 
             guide_feats = torch.cat([guide, img], 1)
         else:
             # Normalize input
             normalized_input = torch.cat([guide, img-img.mean((1,2,3), keepdim=True)], 1)
             
-            # Get spatial features
-            spatial_feats = self.feature_extractor(normalized_input)
+            # Get spatial features with memory optimization
+            with torch.cuda.amp.autocast():
+                spatial_feats = self.feature_extractor(normalized_input)
             validate_tensor(spatial_feats, "Spatial features")
             
             # Get frequency features
-            freq_feats = self.fft_branch(normalized_input)
+            with torch.cuda.amp.autocast():
+                freq_feats = self.fft_branch(normalized_input)
             validate_tensor(freq_feats, "Frequency features")
+            
+            # Clear unnecessary tensors
+            del normalized_input
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             # Combine features
             guide_feats = self.feature_fusion(
                 torch.cat([spatial_feats, freq_feats], 1)
             )
             validate_tensor(guide_feats, "Combined features")
+            
+            # Clear intermediate results
+            del spatial_feats, freq_feats
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         # Edge detection
         cv, ch = c(guide_feats, K=K)
         validate_tensor(cv, "Vertical coefficients")
         validate_tensor(ch, "Horizontal coefficients")
+        
+        del guide_feats
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        # Diffusion iterations
+        # Diffusion iterations with memory optimization
         if self.Npre>0: 
             with torch.no_grad():
                 Npre = randrange(self.Npre) if train else self.Npre
                 logger.debug(f"Running {Npre} pre-iterations")
-                for t in range(Npre):                     
-                    img = diffuse_step(cv, ch, img, l=l)
-                    img = adjust_step(img, source, mask_inv, upsample, downsample, eps=1e-8)
+                for t in range(Npre):
+                    with torch.cuda.amp.autocast():
+                        img = diffuse_step(cv, ch, img, l=l)
+                        img = adjust_step(img, source, mask_inv, upsample, downsample, eps=1e-8)
                     if t % 1000 == 0:  # Log periodically
                         validate_tensor(img, f"Pre-iteration {t}")
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
         if self.Ntrain>0: 
             logger.debug(f"Running {self.Ntrain} training iterations")
             for t in range(self.Ntrain): 
-                img = diffuse_step(cv, ch, img, l=l)
-                img = adjust_step(img, source, mask_inv, upsample, downsample, eps=1e-8)
+                with torch.cuda.amp.autocast():
+                    img = diffuse_step(cv, ch, img, l=l)
+                    img = adjust_step(img, source, mask_inv, upsample, downsample, eps=1e-8)
                 if t % 100 == 0:  # Log periodically
                     validate_tensor(img, f"Train iteration {t}")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         return img, {"cv": cv, "ch": ch}
 
@@ -295,34 +335,44 @@ def diffuse_step(cv, ch, I, l: float=0.24):
         if not validate_tensor(tensor, f"Diffuse step {name}"):
             raise ValueError(f"Invalid {name} in diffuse step")
 
-    # Add frequency domain diffusion
-    fft_I = torch.fft.fft2(I, norm='ortho')
-    
-    # Apply diffusion in frequency domain
-    freq_diffusion = apply_freq_diffusion(fft_I)
-    I_freq = torch.real(torch.fft.ifft2(freq_diffusion, norm='ortho'))
-    
-    validate_tensor(I_freq, "Frequency domain diffusion result")
-    
-    # Combine with spatial diffusion
-    dv = I[:,:,1:,:] - I[:,:,:-1,:]
-    dh = I[:,:,:,1:] - I[:,:,:,:-1]
-    
-    # Weight between frequency and spatial domain results
-    alpha = 0.7  # adjustable parameter
-    I = alpha * I + (1-alpha) * I_freq
-    
-    # Continue with existing diffusion
-    tv = l * cv * dv # vertical transmissions
-    I[:,:,1:,:] -= tv
-    I[:,:,:-1,:] += tv 
+    # Memory efficient implementation
+    with torch.cuda.amp.autocast():
+        # Add frequency domain diffusion
+        fft_I = torch.fft.fft2(I, norm='ortho')
+        
+        # Apply diffusion in frequency domain
+        freq_diffusion = apply_freq_diffusion(fft_I)
+        I_freq = torch.real(torch.fft.ifft2(freq_diffusion, norm='ortho'))
+        
+        del fft_I, freq_diffusion
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        validate_tensor(I_freq, "Frequency domain diffusion result")
+        
+        # Combine with spatial diffusion
+        dv = I[:,:,1:,:] - I[:,:,:-1,:]
+        dh = I[:,:,:,1:] - I[:,:,:,:-1]
+        
+        # Weight between frequency and spatial domain results
+        alpha = 0.7  # adjustable parameter
+        I = alpha * I + (1-alpha) * I_freq
+        
+        del I_freq
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Continue with existing diffusion
+        tv = l * cv * dv # vertical transmissions
+        I[:,:,1:,:] -= tv
+        I[:,:,:-1,:] += tv 
 
-    th = l * ch * dh # horizontal transmissions
-    I[:,:,:,1:] -= th
-    I[:,:,:,:-1] += th 
-    
-    validate_tensor(I, "Diffuse step output")
-    return I
+        th = l * ch * dh # horizontal transmissions
+        I[:,:,:,1:] -= th
+        I[:,:,:,:-1] += th 
+        
+        validate_tensor(I, "Diffuse step output")
+        return I
 
 def adjust_step(img, source, mask_inv, upsample, downsample, eps=1e-8):
     # Validate inputs
