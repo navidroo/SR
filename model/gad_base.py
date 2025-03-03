@@ -20,44 +20,46 @@ class FFTFeatureExtractor(nn.Module):
         )
     
     def forward(self, x):
-        # Convert to frequency domain
-        fft_features = torch.fft.rfft2(x)
+        # Convert to frequency domain using fft2 instead of rfft2
+        fft_features = torch.fft.fft2(x)
         
         # Get magnitude and phase
         magnitude = torch.log(torch.abs(fft_features) + 1e-10)
         phase = torch.angle(fft_features)
         
-        # Concatenate magnitude and phase
-        freq_features = torch.cat([magnitude, phase], dim=1)
+        # Make sure magnitude and phase have the same spatial dimensions as input
+        freq_features = torch.cat([magnitude.real, phase.real], dim=1)
         
         # Process frequency features
         return self.freq_conv(freq_features)
 
 def create_high_freq_mask(shape, threshold=0.5):
     """Create a mask that emphasizes high frequencies"""
-    rows, cols = shape[-2:]
-    crow, ccol = rows // 2, cols // 2
+    b, c, h, w = shape
     
     # Create a coordinate grid
-    y, x = torch.meshgrid(torch.arange(rows), torch.arange(cols))
+    y = torch.linspace(-1, 1, h).view(-1, 1).repeat(1, w)
+    x = torch.linspace(-1, 1, w).view(1, -1).repeat(h, 1)
     
     # Calculate distance from center
-    d = torch.sqrt((y - crow)**2 + (x - ccol)**2)
+    d = torch.sqrt(x*x + y*y)
     
     # Create high-pass filter mask
-    mask = (d > threshold * crow).float()
+    mask = (d > threshold).float()
     return mask.cuda()
 
 def apply_freq_diffusion(fft_features, sigma=0.1):
     """Apply Gaussian filtering in frequency domain"""
-    magnitude = torch.abs(fft_features)
-    phase = torch.angle(fft_features)
+    # Handle real and imaginary parts separately
+    real_part = fft_features.real
+    imag_part = fft_features.imag
     
-    # Apply Gaussian smoothing to magnitude
-    smoothed_magnitude = F.gaussian_blur(magnitude, kernel_size=3, sigma=sigma)
+    # Apply Gaussian smoothing to both parts
+    smoothed_real = F.gaussian_blur(real_part, kernel_size=3, sigma=sigma)
+    smoothed_imag = F.gaussian_blur(imag_part, kernel_size=3, sigma=sigma)
     
-    # Reconstruct complex numbers
-    return smoothed_magnitude * torch.exp(1j * phase)
+    # Reconstruct complex tensor
+    return torch.complex(smoothed_real, smoothed_imag)
 
 class GADBase(nn.Module):
     def __init__(
@@ -158,10 +160,13 @@ class GADBase(nn.Module):
 
 def c(I, K: float=0.03):
     # Add frequency domain analysis for edge detection
-    fft_features = torch.fft.rfft2(I)
+    fft_features = torch.fft.fft2(I)
     magnitude = torch.abs(fft_features)
-    high_freq_mask = create_high_freq_mask(magnitude.shape)
-    edge_response = torch.fft.irfft2(fft_features * high_freq_mask.unsqueeze(0).unsqueeze(0))
+    high_freq_mask = create_high_freq_mask(I.shape)
+    
+    # Apply mask and transform back
+    masked_fft = fft_features * high_freq_mask.unsqueeze(0).unsqueeze(0)
+    edge_response = torch.fft.ifft2(masked_fft).real
     
     # Combine with existing edge detection
     cv = g(torch.unsqueeze(torch.mean(torch.abs(I[:,:,1:,:] - I[:,:,:-1,:]) + edge_response[:,:,1:,:], 1), 1), K)
@@ -174,11 +179,11 @@ def g(x, K: float=0.03):
 
 def diffuse_step(cv, ch, I, l: float=0.24):
     # Add frequency domain diffusion
-    fft_I = torch.fft.rfft2(I)
+    fft_I = torch.fft.fft2(I)
     
     # Apply diffusion in frequency domain
     freq_diffusion = apply_freq_diffusion(fft_I)
-    I_freq = torch.fft.irfft2(freq_diffusion)
+    I_freq = torch.fft.ifft2(freq_diffusion).real
     
     # Combine with spatial diffusion
     dv = I[:,:,1:,:] - I[:,:,:-1,:]
