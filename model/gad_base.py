@@ -252,10 +252,15 @@ class GADBase(nn.Module):
 
         # Helper function to compute loss
         def compute_loss(pred_img):
-            # L1 loss between predicted and source images
-            pred_lr = downsample(pred_img)
-            loss = torch.mean(torch.abs(pred_lr - source))
-            return loss.item()
+            with torch.no_grad():
+                # L1 loss between predicted and source images
+                pred_lr = downsample(pred_img)
+                # Ensure both tensors are on the same device and same dtype
+                pred_lr = pred_lr.to(source.device, source.dtype)
+                # Calculate L1 loss with proper reduction
+                loss = torch.mean(torch.abs(pred_lr - source))
+                # Convert to float before returning
+                return float(loss.cpu().item())
 
         # Feature extraction with memory optimization
         if self.feature_extractor is None: 
@@ -494,20 +499,30 @@ class EarlyStopping:
         self.min_delta = min_delta
         self.verbose = verbose
         self.counter = 0
-        self.best_loss = None
+        self.best_loss = float('inf')
         self.early_stop = False
         self.logger = logging.getLogger(__name__)
 
     def __call__(self, val_loss):
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss > self.best_loss - self.min_delta:
-            self.counter += 1
-            if self.verbose:
-                self.logger.info(f'EarlyStopping counter: {self.counter} out of {self.patience}')
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
+        if not isinstance(val_loss, (int, float)):
+            self.logger.warning(f"Invalid loss value type: {type(val_loss)}")
+            return False
+            
+        if val_loss < 0:
+            self.logger.warning(f"Negative loss value: {val_loss}")
+            return False
+
+        # First call or better loss
+        if self.best_loss == float('inf') or val_loss < self.best_loss - self.min_delta:
             self.best_loss = val_loss
             self.counter = 0
+            if self.verbose:
+                self.logger.info(f'Loss improved to {val_loss:.6f}')
+        else:
+            self.counter += 1
+            if self.verbose:
+                self.logger.info(f'EarlyStopping counter: {self.counter} out of {self.patience} (current: {val_loss:.6f}, best: {self.best_loss:.6f})')
+            if self.counter >= self.patience:
+                self.early_stop = True
+
         return self.early_stop 
