@@ -70,12 +70,14 @@ class FFTFeatureExtractor(nn.Module):
             nn.Conv2d(out_channels, out_channels, 3, padding=1)
         )
     
+    @torch.cuda.amp.autocast(enabled=False)  # Disable AMP for FFT operations
     def forward(self, x):
         # Input validation
         if not validate_tensor(x, "FFTFeatureExtractor input"):
             raise ValueError("Invalid input tensor")
 
         # Convert to frequency domain
+        x = x.to(torch.float32)  # Ensure float32 for FFT
         fft_features = torch.fft.fft2(x, norm='ortho')
         
         # Get magnitude and phase
@@ -90,7 +92,9 @@ class FFTFeatureExtractor(nn.Module):
         freq_features = torch.cat([magnitude, phase], dim=1)
         
         # Process and validate output
-        output = self.freq_conv(freq_features)
+        with torch.cuda.amp.autocast():  # Re-enable AMP for convolutions
+            output = self.freq_conv(freq_features)
+        
         if not validate_tensor(output, "FFTFeatureExtractor output"):
             logger.warning("FFTFeatureExtractor output contains invalid values")
         
@@ -119,24 +123,25 @@ def apply_freq_diffusion(fft_features, sigma=0.1):
         logger.error("Input to freq_diffusion must be complex")
         raise ValueError("Input must be complex tensor")
     
-    # Split into real and imaginary parts
-    real_part = fft_features.real
-    imag_part = fft_features.imag
-    
-    # Validate parts
-    validate_tensor(real_part, "Freq diffusion real part")
-    validate_tensor(imag_part, "Freq diffusion imag part")
-    
-    # Apply custom Gaussian smoothing to both parts
-    smoothed_real = gaussian_blur(real_part, kernel_size=3, sigma=sigma)
-    smoothed_imag = gaussian_blur(imag_part, kernel_size=3, sigma=sigma)
-    
-    # Reconstruct and validate complex tensor
-    result = torch.complex(smoothed_real, smoothed_imag)
-    if not validate_tensor(torch.abs(result), "Freq diffusion output magnitude"):
-        logger.warning("Frequency diffusion output may be unstable")
-    
-    return result
+    with torch.cuda.amp.autocast(enabled=False):  # Disable AMP for complex operations
+        # Split into real and imaginary parts
+        real_part = fft_features.real
+        imag_part = fft_features.imag
+        
+        # Validate parts
+        validate_tensor(real_part, "Freq diffusion real part")
+        validate_tensor(imag_part, "Freq diffusion imag part")
+        
+        # Apply custom Gaussian smoothing to both parts
+        smoothed_real = gaussian_blur(real_part, kernel_size=3, sigma=sigma)
+        smoothed_imag = gaussian_blur(imag_part, kernel_size=3, sigma=sigma)
+        
+        # Reconstruct and validate complex tensor
+        result = torch.complex(smoothed_real, smoothed_imag)
+        if not validate_tensor(torch.abs(result), "Freq diffusion output magnitude"):
+            logger.warning("Frequency diffusion output may be unstable")
+        
+        return result
 
 class GADBase(nn.Module):
     def __init__(
@@ -302,20 +307,23 @@ def c(I, K: float=0.03):
         raise ValueError("Invalid input to edge detection")
 
     # Add frequency domain analysis for edge detection
-    fft_features = torch.fft.fft2(I, norm='ortho')
-    magnitude = torch.abs(fft_features)
-    high_freq_mask = create_high_freq_mask(I.shape)
-    
-    # Apply mask and transform back
-    masked_fft = fft_features * high_freq_mask.unsqueeze(0).unsqueeze(0)
-    edge_response = torch.fft.ifft2(masked_fft, norm='ortho')
-    edge_response = torch.real(edge_response)
+    with torch.cuda.amp.autocast(enabled=False):  # Disable AMP for FFT
+        I = I.to(torch.float32)  # Ensure float32
+        fft_features = torch.fft.fft2(I, norm='ortho')
+        magnitude = torch.abs(fft_features)
+        high_freq_mask = create_high_freq_mask(I.shape)
+        
+        # Apply mask and transform back
+        masked_fft = fft_features * high_freq_mask.unsqueeze(0).unsqueeze(0)
+        edge_response = torch.fft.ifft2(masked_fft, norm='ortho')
+        edge_response = torch.real(edge_response)
     
     validate_tensor(edge_response, "Edge response")
     
     # Combine with existing edge detection
-    cv = g(torch.unsqueeze(torch.mean(torch.abs(I[:,:,1:,:] - I[:,:,:-1,:]) + edge_response[:,:,1:,:], 1), 1), K)
-    ch = g(torch.unsqueeze(torch.mean(torch.abs(I[:,:,:,1:] - I[:,:,:,:-1]) + edge_response[:,:,:,1:], 1), 1), K)
+    with torch.cuda.amp.autocast():  # Re-enable AMP for the rest
+        cv = g(torch.unsqueeze(torch.mean(torch.abs(I[:,:,1:,:] - I[:,:,:-1,:]) + edge_response[:,:,1:,:], 1), 1), K)
+        ch = g(torch.unsqueeze(torch.mean(torch.abs(I[:,:,:,1:] - I[:,:,:,:-1]) + edge_response[:,:,:,1:], 1), 1), K)
     
     return cv, ch
 
@@ -336,8 +344,9 @@ def diffuse_step(cv, ch, I, l: float=0.24):
             raise ValueError(f"Invalid {name} in diffuse step")
 
     # Memory efficient implementation
-    with torch.cuda.amp.autocast():
+    with torch.cuda.amp.autocast(enabled=False):  # Disable AMP for FFT operations
         # Add frequency domain diffusion
+        I = I.to(torch.float32)  # Ensure float32
         fft_I = torch.fft.fft2(I, norm='ortho')
         
         # Apply diffusion in frequency domain
@@ -349,7 +358,9 @@ def diffuse_step(cv, ch, I, l: float=0.24):
             torch.cuda.empty_cache()
         
         validate_tensor(I_freq, "Frequency domain diffusion result")
-        
+    
+    # Re-enable AMP for the rest of operations
+    with torch.cuda.amp.autocast():
         # Combine with spatial diffusion
         dv = I[:,:,1:,:] - I[:,:,:-1,:]
         dh = I[:,:,:,1:] - I[:,:,:,:-1]
