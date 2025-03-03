@@ -118,28 +118,41 @@ def create_high_freq_mask(shape, threshold=0.5):
 
 def apply_freq_diffusion(fft_features, sigma=0.1):
     """Apply Gaussian filtering in frequency domain"""
-    # Validate input
-    if not torch.is_complex(fft_features):
-        logger.error("Input to freq_diffusion must be complex")
-        raise ValueError("Input must be complex tensor")
+    # Memory optimization: clear cache at start
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     with torch.cuda.amp.autocast(enabled=False):  # Disable AMP for complex operations
-        # Split into real and imaginary parts
+        # Process real and imaginary parts separately to save memory
         real_part = fft_features.real
+        # Clear fft_features as we no longer need it
         imag_part = fft_features.imag
+        del fft_features
         
-        # Validate parts
-        validate_tensor(real_part, "Freq diffusion real part")
-        validate_tensor(imag_part, "Freq diffusion imag part")
-        
-        # Apply custom Gaussian smoothing to both parts
+        # Process real part
         smoothed_real = gaussian_blur(real_part, kernel_size=3, sigma=sigma)
-        smoothed_imag = gaussian_blur(imag_part, kernel_size=3, sigma=sigma)
+        del real_part
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
-        # Reconstruct and validate complex tensor
+        # Process imaginary part
+        smoothed_imag = gaussian_blur(imag_part, kernel_size=3, sigma=sigma)
+        del imag_part
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Reconstruct complex tensor
         result = torch.complex(smoothed_real, smoothed_imag)
-        if not validate_tensor(torch.abs(result), "Freq diffusion output magnitude"):
-            logger.warning("Frequency diffusion output may be unstable")
+        del smoothed_real, smoothed_imag
+        
+        # Validate only magnitude to save memory
+        with torch.no_grad():
+            magnitude = torch.abs(result)
+            is_valid = not (torch.isnan(magnitude).any() or torch.isinf(magnitude).any())
+            del magnitude
+            
+            if not is_valid:
+                logger.warning("Frequency diffusion output may be unstable")
         
         return result
 
@@ -338,10 +351,15 @@ def g(x, K: float=0.03):
     return result
 
 def diffuse_step(cv, ch, I, l: float=0.24):
-    # Validate inputs
-    for name, tensor in [("cv", cv), ("ch", ch), ("I", I)]:
-        if not validate_tensor(tensor, f"Diffuse step {name}"):
-            raise ValueError(f"Invalid {name} in diffuse step")
+    # Memory optimization: clear cache at start
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Validate inputs without storing validation tensors
+    with torch.no_grad():
+        for name, tensor in [("cv", cv), ("ch", ch), ("I", I)]:
+            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                raise ValueError(f"Invalid {name} in diffuse step")
 
     # Memory efficient implementation
     with torch.cuda.amp.autocast(enabled=False):  # Disable AMP for FFT operations
@@ -351,58 +369,80 @@ def diffuse_step(cv, ch, I, l: float=0.24):
         
         # Apply diffusion in frequency domain
         freq_diffusion = apply_freq_diffusion(fft_I)
-        I_freq = torch.real(torch.fft.ifft2(freq_diffusion, norm='ortho'))
+        del fft_I
         
-        del fft_I, freq_diffusion
+        I_freq = torch.real(torch.fft.ifft2(freq_diffusion, norm='ortho'))
+        del freq_diffusion
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        
-        validate_tensor(I_freq, "Frequency domain diffusion result")
     
     # Re-enable AMP for the rest of operations
     with torch.cuda.amp.autocast():
-        # Combine with spatial diffusion
+        # Compute spatial gradients
         dv = I[:,:,1:,:] - I[:,:,:-1,:]
         dh = I[:,:,:,1:] - I[:,:,:,:-1]
         
         # Weight between frequency and spatial domain results
         alpha = 0.7  # adjustable parameter
         I = alpha * I + (1-alpha) * I_freq
-        
         del I_freq
+        
+        # Apply transmissions with memory optimization
+        tv = l * cv * dv  # vertical transmissions
+        del cv, dv
+        I[:,:,1:,:] -= tv
+        I[:,:,:-1,:] += tv
+        del tv
+        
+        th = l * ch * dh  # horizontal transmissions
+        del ch, dh
+        I[:,:,:,1:] -= th
+        I[:,:,:,:-1] += th
+        del th
+        
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        # Continue with existing diffusion
-        tv = l * cv * dv # vertical transmissions
-        I[:,:,1:,:] -= tv
-        I[:,:,:-1,:] += tv 
-
-        th = l * ch * dh # horizontal transmissions
-        I[:,:,:,1:] -= th
-        I[:,:,:,:-1] += th 
+        # Quick validation without storing additional tensors
+        with torch.no_grad():
+            if torch.isnan(I).any() or torch.isinf(I).any():
+                logger.error("Invalid values in diffuse step output")
         
-        validate_tensor(I, "Diffuse step output")
         return I
 
 def adjust_step(img, source, mask_inv, upsample, downsample, eps=1e-8):
-    # Validate inputs
-    validate_tensor(img, "Adjust step input image")
-    validate_tensor(source, "Adjust step source")
+    # Memory optimization: clear cache at start
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    # Iss = subsample img
+    # Quick validation without storing validation tensors
+    with torch.no_grad():
+        if torch.isnan(img).any() or torch.isinf(img).any():
+            raise ValueError("Invalid input image in adjust step")
+        if torch.isnan(source).any() or torch.isinf(source).any():
+            raise ValueError("Invalid source in adjust step")
+
+    # Compute downsampled image
     img_ss = downsample(img)
-    validate_tensor(img_ss, "Downsampled image")
-
-    # Rss = source / Iss
-    ratio_ss = source / (img_ss + eps)
-    ratio_ss[mask_inv] = 1
-    validate_tensor(ratio_ss, "Adjustment ratio")
-
-    # R = NN upsample r
+    
+    # Compute ratio with memory optimization
+    ratio_ss = torch.empty_like(source)
+    ratio_ss = torch.where(mask_inv, torch.ones_like(source), source / (img_ss + eps))
+    del img_ss
+    
+    # Compute final result with memory optimization
     ratio = upsample(ratio_ss)
-    validate_tensor(ratio, "Upsampled ratio")
-
+    del ratio_ss
+    
     result = img * ratio
-    validate_tensor(result, "Adjust step output")
+    del ratio
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Quick validation of output
+    with torch.no_grad():
+        if torch.isnan(result).any() or torch.isinf(result).any():
+            logger.error("Invalid values in adjust step output")
+    
     return result 
