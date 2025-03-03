@@ -287,6 +287,10 @@ class GADBase(nn.Module):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        # Initialize early stopping for diffusion iterations
+        early_stopper = EarlyStopping(patience=5, min_delta=1e-4)
+        prev_img = None
+
         # Diffusion iterations with memory optimization
         if self.Npre>0: 
             with torch.no_grad():
@@ -296,10 +300,23 @@ class GADBase(nn.Module):
                     with torch.cuda.amp.autocast():
                         img = diffuse_step(cv, ch, img, l=l)
                         img = adjust_step(img, source, mask_inv, upsample, downsample, eps=1e-8)
-                    if t % 1000 == 0:  # Log periodically
+                    
+                    # Check for convergence every 100 iterations
+                    if t % 100 == 0:
+                        if prev_img is not None:
+                            # Calculate relative change
+                            rel_change = torch.norm(img - prev_img) / (torch.norm(prev_img) + eps)
+                            if early_stopper(rel_change):
+                                logger.info(f"Early stopping at pre-iteration {t} due to convergence")
+                                break
+                        prev_img = img.clone()
                         validate_tensor(img, f"Pre-iteration {t}")
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
+
+        # Reset early stopping for training iterations
+        early_stopper = EarlyStopping(patience=3, min_delta=1e-4)
+        prev_img = None
 
         if self.Ntrain>0: 
             logger.debug(f"Running {self.Ntrain} training iterations")
@@ -307,7 +324,16 @@ class GADBase(nn.Module):
                 with torch.cuda.amp.autocast():
                     img = diffuse_step(cv, ch, img, l=l)
                     img = adjust_step(img, source, mask_inv, upsample, downsample, eps=1e-8)
-                if t % 100 == 0:  # Log periodically
+                
+                # Check for convergence every 50 iterations
+                if t % 50 == 0:
+                    if prev_img is not None:
+                        # Calculate relative change
+                        rel_change = torch.norm(img - prev_img) / (torch.norm(prev_img) + eps)
+                        if early_stopper(rel_change):
+                            logger.info(f"Early stopping at training iteration {t} due to convergence")
+                            break
+                    prev_img = img.clone()
                     validate_tensor(img, f"Train iteration {t}")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -446,3 +472,28 @@ def adjust_step(img, source, mask_inv, upsample, downsample, eps=1e-8):
             logger.error("Invalid values in adjust step output")
     
     return result 
+
+class EarlyStopping:
+    """Early stopping to prevent overfitting and detect convergence"""
+    def __init__(self, patience=5, min_delta=1e-4, verbose=True):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+        self.logger = logging.getLogger(__name__)
+
+    def __call__(self, val_loss):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.verbose:
+                self.logger.info(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.counter = 0
+        return self.early_stop 
