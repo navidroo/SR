@@ -250,6 +250,13 @@ class GADBase(nn.Module):
         downsample = nn.AdaptiveAvgPool2d((sh, sw))
         upsample = lambda x: F.interpolate(x, (h, w), mode='nearest')
 
+        # Helper function to compute loss
+        def compute_loss(pred_img):
+            # L1 loss between predicted and source images
+            pred_lr = downsample(pred_img)
+            loss = torch.mean(torch.abs(pred_lr - source))
+            return loss.item()
+
         # Feature extraction with memory optimization
         if self.feature_extractor is None: 
             guide_feats = torch.cat([guide, img], 1)
@@ -294,7 +301,7 @@ class GADBase(nn.Module):
 
         # Initialize early stopping for diffusion iterations
         early_stopper = EarlyStopping(patience=self.pre_patience, min_delta=self.min_delta)
-        prev_img = None
+        prev_loss = None
 
         # Diffusion iterations with memory optimization
         if self.Npre>0: 
@@ -308,20 +315,21 @@ class GADBase(nn.Module):
                     
                     # Check for convergence every 100 iterations
                     if t % 100 == 0:
-                        if prev_img is not None:
-                            # Calculate relative change
-                            rel_change = torch.norm(img - prev_img) / (torch.norm(prev_img) + eps)
-                            if early_stopper(rel_change):
-                                logger.info(f"Early stopping at pre-iteration {t} due to convergence")
+                        current_loss = compute_loss(img)
+                        logger.info(f"Pre-iteration {t}, Loss: {current_loss:.6f}")
+                        
+                        if prev_loss is not None:
+                            if early_stopper(current_loss):
+                                logger.info(f"Early stopping at pre-iteration {t} due to convergence. Final loss: {current_loss:.6f}")
                                 break
-                        prev_img = img.clone()
+                        prev_loss = current_loss
                         validate_tensor(img, f"Pre-iteration {t}")
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
 
         # Reset early stopping for training iterations
         early_stopper = EarlyStopping(patience=self.train_patience, min_delta=self.min_delta)
-        prev_img = None
+        prev_loss = None
 
         if self.Ntrain>0: 
             logger.debug(f"Running {self.Ntrain} training iterations")
@@ -332,13 +340,14 @@ class GADBase(nn.Module):
                 
                 # Check for convergence every 50 iterations
                 if t % 50 == 0:
-                    if prev_img is not None:
-                        # Calculate relative change
-                        rel_change = torch.norm(img - prev_img) / (torch.norm(prev_img) + eps)
-                        if early_stopper(rel_change):
-                            logger.info(f"Early stopping at training iteration {t} due to convergence")
+                    current_loss = compute_loss(img)
+                    logger.info(f"Training iteration {t}, Loss: {current_loss:.6f}")
+                    
+                    if prev_loss is not None:
+                        if early_stopper(current_loss):
+                            logger.info(f"Early stopping at training iteration {t} due to convergence. Final loss: {current_loss:.6f}")
                             break
-                    prev_img = img.clone()
+                    prev_loss = current_loss
                     validate_tensor(img, f"Train iteration {t}")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
