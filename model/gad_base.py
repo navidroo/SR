@@ -595,16 +595,21 @@ class EarlyStopping:
             self.logger.warning(f"Negative loss value: {val_loss}")
             return False
 
+        # Scale the values to handle very small numbers better
+        scaled_val_loss = val_loss * 1e6  # Scale up by 1 million
+        scaled_best_loss = self.best_loss * 1e6 if self.best_loss != float('inf') else float('inf')
+        scaled_min_delta = self.min_delta * 1e6
+
         # First call or better loss
-        if self.best_loss == float('inf') or val_loss < self.best_loss - self.min_delta:
+        if self.best_loss == float('inf') or scaled_val_loss < scaled_best_loss - scaled_min_delta:
             self.best_loss = val_loss
             self.counter = 0
             if self.verbose:
-                self.logger.info(f'Loss improved to {val_loss:.6f}')
+                self.logger.info(f'Loss improved to {val_loss:.8f}')
         else:
             self.counter += 1
             if self.verbose:
-                self.logger.info(f'EarlyStopping counter: {self.counter} out of {self.patience} (current: {val_loss:.6f}, best: {self.best_loss:.6f})')
+                self.logger.info(f'EarlyStopping counter: {self.counter} out of {self.patience} (current: {val_loss:.8f}, best: {self.best_loss:.8f})')
             if self.counter >= self.patience:
                 self.early_stop = True
 
