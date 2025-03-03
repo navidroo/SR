@@ -253,14 +253,53 @@ class GADBase(nn.Module):
         # Helper function to compute loss
         def compute_loss(pred_img):
             with torch.no_grad():
-                # L1 loss between predicted and source images
-                pred_lr = downsample(pred_img)
-                # Ensure both tensors are on the same device and same dtype
-                pred_lr = pred_lr.to(source.device, source.dtype)
-                # Calculate L1 loss with proper reduction
-                loss = torch.mean(torch.abs(pred_lr - source))
-                # Convert to float before returning
-                return float(loss.cpu().item())
+                try:
+                    # Ensure pred_img is valid
+                    if not validate_tensor(pred_img, "Prediction for loss computation", log_stats=False):
+                        logger.error("Invalid prediction tensor in loss computation")
+                        return float('inf')
+                    
+                    # Downsample prediction
+                    pred_lr = downsample(pred_img)
+                    
+                    # Ensure tensors are on same device and dtype
+                    pred_lr = pred_lr.to(source.device, source.dtype)
+                    
+                    # Validate downsampled prediction
+                    if not validate_tensor(pred_lr, "Downsampled prediction", log_stats=False):
+                        logger.error("Invalid downsampled prediction in loss computation")
+                        return float('inf')
+                    
+                    # Calculate L1 loss with proper reduction
+                    diff = torch.abs(pred_lr - source)
+                    if not validate_tensor(diff, "Loss difference", log_stats=False):
+                        logger.error("Invalid difference in loss computation")
+                        return float('inf')
+                    
+                    # Compute mean only over valid regions (where mask_inv is False)
+                    valid_mask = ~mask_inv
+                    if valid_mask.any():
+                        loss = torch.sum(diff * valid_mask.float()) / (valid_mask.sum() + 1e-8)
+                    else:
+                        loss = torch.mean(diff)
+                    
+                    # Ensure loss is valid
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        logger.error("Invalid loss value computed")
+                        return float('inf')
+                    
+                    # Convert to float and ensure positive
+                    loss_value = float(loss.cpu().item())
+                    if loss_value < 0:
+                        logger.error(f"Negative loss value computed: {loss_value}")
+                        return float('inf')
+                    
+                    logger.debug(f"Loss computation successful: {loss_value:.6f}")
+                    return loss_value
+                    
+                except Exception as e:
+                    logger.error(f"Error in loss computation: {str(e)}")
+                    return float('inf')
 
         # Feature extraction with memory optimization
         if self.feature_extractor is None: 
