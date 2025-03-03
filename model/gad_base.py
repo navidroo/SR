@@ -2,6 +2,7 @@ from random import randrange
 from re import I
 import logging
 import numpy as np
+import math
 
 import torch
 from torch import nn
@@ -15,6 +16,38 @@ logger = logging.getLogger(__name__)
 
 INPUT_DIM = 4
 FEATURE_DIM = 64
+
+def create_gaussian_kernel(kernel_size=3, sigma=1.0, channels=1):
+    """Create a Gaussian kernel for blurring"""
+    # Create a 1D Gaussian kernel
+    x = torch.linspace(-kernel_size//2, kernel_size//2, kernel_size)
+    gauss = torch.exp(-(x**2)/(2*sigma**2))
+    gauss = gauss / gauss.sum()
+    
+    # Create 2D kernel by outer product
+    kernel_2d = gauss.view(-1, 1) * gauss.view(1, -1)
+    
+    # Expand to match PyTorch's convolution format: (out_channels, in_channels/groups, height, width)
+    kernel = kernel_2d.expand(channels, 1, kernel_size, kernel_size)
+    
+    return kernel
+
+def gaussian_blur(x, kernel_size=3, sigma=1.0):
+    """Apply Gaussian blur to a tensor"""
+    if not isinstance(kernel_size, int):
+        kernel_size = 3
+    if kernel_size % 2 == 0:
+        kernel_size = kernel_size + 1
+    
+    # Create Gaussian kernel
+    kernel = create_gaussian_kernel(kernel_size, sigma, x.size(1)).to(x.device)
+    
+    # Apply padding to maintain size
+    padding = kernel_size // 2
+    
+    # Apply convolution for each channel independently
+    x_padded = F.pad(x, (padding, padding, padding, padding), mode='reflect')
+    return F.conv2d(x_padded, kernel, groups=x.size(1))
 
 def validate_tensor(tensor, name, log_stats=True):
     """Validate tensor for common issues"""
@@ -94,9 +127,9 @@ def apply_freq_diffusion(fft_features, sigma=0.1):
     validate_tensor(real_part, "Freq diffusion real part")
     validate_tensor(imag_part, "Freq diffusion imag part")
     
-    # Apply Gaussian smoothing to both parts
-    smoothed_real = F.gaussian_blur(real_part, kernel_size=3, sigma=sigma)
-    smoothed_imag = F.gaussian_blur(imag_part, kernel_size=3, sigma=sigma)
+    # Apply custom Gaussian smoothing to both parts
+    smoothed_real = gaussian_blur(real_part, kernel_size=3, sigma=sigma)
+    smoothed_imag = gaussian_blur(imag_part, kernel_size=3, sigma=sigma)
     
     # Reconstruct and validate complex tensor
     result = torch.complex(smoothed_real, smoothed_imag)
