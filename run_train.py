@@ -34,7 +34,10 @@ class Trainer:
         self.model = GADBase( 
             args.feature_extractor, 
             Npre=args.Npre,
-            Ntrain=args.Ntrain, 
+            Ntrain=args.Ntrain,
+            pre_patience=args.pre_patience,
+            train_patience=args.train_patience,
+            min_delta=args.min_delta
         ).cuda()
 
         self.experiment_folder, self.args.expN, self.args.randN = new_log(os.path.join(args.save_dir, args.dataset), args)

@@ -160,6 +160,8 @@ class GADBase(nn.Module):
     def __init__(
             self, feature_extractor='Unet',
             Npre=8000, Ntrain=1024, 
+            pre_patience=5, train_patience=3,
+            min_delta=1e-4
     ):
         super().__init__()
         logger.info(f"Initializing GADBase with {feature_extractor} extractor")
@@ -167,6 +169,9 @@ class GADBase(nn.Module):
         self.feature_extractor_name = feature_extractor    
         self.Npre = Npre
         self.Ntrain = Ntrain
+        self.pre_patience = pre_patience
+        self.train_patience = train_patience
+        self.min_delta = min_delta
  
         if feature_extractor=='none': 
             logger.info("Using RGB version without feature extractor")
@@ -288,7 +293,7 @@ class GADBase(nn.Module):
             torch.cuda.empty_cache()
 
         # Initialize early stopping for diffusion iterations
-        early_stopper = EarlyStopping(patience=5, min_delta=1e-4)
+        early_stopper = EarlyStopping(patience=self.pre_patience, min_delta=self.min_delta)
         prev_img = None
 
         # Diffusion iterations with memory optimization
@@ -315,7 +320,7 @@ class GADBase(nn.Module):
                             torch.cuda.empty_cache()
 
         # Reset early stopping for training iterations
-        early_stopper = EarlyStopping(patience=3, min_delta=1e-4)
+        early_stopper = EarlyStopping(patience=self.train_patience, min_delta=self.min_delta)
         prev_img = None
 
         if self.Ntrain>0: 
